@@ -350,12 +350,19 @@ std::vector<hardware_interface::StateInterface> Z1System::export_state_interface
 std::vector<hardware_interface::CommandInterface> Z1System::export_command_interfaces()
 {
   std::vector<hardware_interface::CommandInterface> interfaces;
-  interfaces.reserve(get_hardware_info().joints.size());
+  interfaces.reserve(get_hardware_info().joints.size() * 2);
 
   for (const auto & joint : get_hardware_info().joints) {
     const auto index = static_cast<size_t>(motor_index_for_joint(joint.name));
     interfaces.emplace_back(
       joint.name, hardware_interface::HW_IF_POSITION, &command_position_[index]);
+    // Torque mode: the same joints also export an effort command interface,
+    // written by effort-interface controllers and sent to the arm in LOWCMD.
+    // The clamp matches const.xacro's torqueMax (joint2 is the dual-motor
+    // joint: 60 N*m).
+    effort_limit_[index] = (index == 1) ? 60.0F : 30.0F;
+    interfaces.emplace_back(
+      joint.name, hardware_interface::HW_IF_EFFORT, &command_effort_[index]);
   }
   return interfaces;
 }
@@ -666,6 +673,7 @@ void Z1System::assemble_frame()
 {
   const auto requested = static_cast<UNITREE_ARM::ArmFSMState>(requested_state_.load());
   const bool joint_control = requested == UNITREE_ARM::ArmFSMState::JOINTCTRL;
+  const bool lowcmd = requested == UNITREE_ARM::ArmFSMState::LOWCMD;
 
   cmd_.head[0] = kHead0;
   cmd_.head[1] = kHead1;
@@ -675,6 +683,29 @@ void Z1System::assemble_frame()
   // CARTESIAN is not reachable from here - so leaving it true for anything else
   // would only be misleading.
   cmd_.track = joint_control;
+
+  if (lowcmd) {
+    // LOWCMD bypasses z1_ctrl's joint servo law: the payload is forwarded to the
+    // arm's lowlevel motor controller. Send only the commanded torque - clamped
+    // here as the last line of defence - and let position/velocity follow the
+    // measurement with zero gains, so the motor's internal loops have nothing to
+    // fight. Reached only through the command-mode-switch hooks or the
+    // set_fsm_state service, never through activate_fsm_sequence.
+    for (size_t i = 0; i < kMotorCount; ++i) {
+      auto & joint_cmd = cmd_.valueUnion.jointCmd[i];
+      const float tau = static_cast<float>(command_effort_[i]);
+      joint_cmd.T = std::clamp(tau, -effort_limit_[i], effort_limit_[i]);
+      joint_cmd.Pos = static_cast<float>(motor_position_[i]);
+      joint_cmd.W = static_cast<float>(motor_velocity_[i]);
+      joint_cmd.K_P = 0.0F;
+      joint_cmd.K_W = 0.0F;
+      if (i == kGripperIndex && !has_gripper_) {
+        // No gripper joint: never command torque into the (absent) seventh motor.
+        joint_cmd.T = 0.0F;
+      }
+    }
+    return;
+  }
 
   if (joint_control) {
     for (size_t i = 0; i < kMotorCount; ++i) {
@@ -929,6 +960,83 @@ bool Z1System::request_state_and_wait(
   return false;
 }
 
+bool Z1System::request_lowcmd(std::string & error)
+{
+  // z1_ctrl 的 FSM 只允许 PASSIVE -> LOWCMD(反汇编 libZ1_x86_64.so 的证据:
+  // State_JointSpace::checkChange 的掩码 0x4ffa 不含 bit16,State_Passive 的
+  // 掩码 0x1500c 含 bit16)。已在 PASSIVE 则直接请求,否则先经 PASSIVE
+  // (臂短暂失力,几十 ms 级——持臂者可接受)。
+  if (reported_state_.load() != static_cast<int32_t>(UNITREE_ARM::ArmFSMState::PASSIVE)) {
+    if (!request_state_and_wait(UNITREE_ARM::ArmFSMState::PASSIVE, "", error)) {
+      return false;
+    }
+  }
+  return request_state_and_wait(UNITREE_ARM::ArmFSMState::LOWCMD, "", error);
+}
+
+// ---------------------------------------------------------------------------
+// Command mode switching (position <-> effort, JOINTCTRL <-> LOWCMD)
+// ---------------------------------------------------------------------------
+
+UNITREE_ARM::ArmFSMState Z1System::fsm_state_for_interfaces(
+  const std::vector<std::string> & start_interfaces)
+{
+  bool has_effort = false;
+  bool has_position = false;
+  for (const auto & iface : start_interfaces) {
+    has_effort |= iface.find(std::string("/") + hardware_interface::HW_IF_EFFORT) !=
+                  std::string::npos;
+    has_position |= iface.find(std::string("/") + hardware_interface::HW_IF_POSITION) !=
+                    std::string::npos;
+  }
+  if (has_effort && !has_position) {
+    return UNITREE_ARM::ArmFSMState::LOWCMD;
+  }
+  if (has_position && !has_effort) {
+    return UNITREE_ARM::ArmFSMState::JOINTCTRL;
+  }
+  // Empty (a controller was only stopped) or a mix of position and effort: the
+  // FSM stays where it is.
+  return UNITREE_ARM::ArmFSMState::INVALID;
+}
+
+hardware_interface::return_type Z1System::prepare_command_mode_switch(
+  const std::vector<std::string> & start_interfaces, const std::vector<std::string> &)
+{
+  if (start_interfaces.empty()) {
+    return hardware_interface::return_type::OK;
+  }
+  if (fsm_state_for_interfaces(start_interfaces) == UNITREE_ARM::ArmFSMState::INVALID) {
+    RCLCPP_ERROR(
+      get_logger(),
+      "refusing command mode switch: the interface set mixes position and effort");
+    return hardware_interface::return_type::ERROR;
+  }
+  return hardware_interface::return_type::OK;
+}
+
+hardware_interface::return_type Z1System::perform_command_mode_switch(
+  const std::vector<std::string> & start_interfaces, const std::vector<std::string> &)
+{
+  const auto target = fsm_state_for_interfaces(start_interfaces);
+  if (target == UNITREE_ARM::ArmFSMState::INVALID) {
+    return hardware_interface::return_type::OK;
+  }
+  std::string error;
+  // LOWCMD 只能从 PASSIVE 进入(FSM 转移表限制),走两步路径;反向
+  // LOWCMD -> JOINTCTRL 直达合法。
+  const bool ok = (target == UNITREE_ARM::ArmFSMState::LOWCMD)
+                    ? request_lowcmd(error)
+                    : request_state_and_wait(target, "", error);
+  if (!ok) {
+    RCLCPP_ERROR(
+      get_logger(), "FSM transition to %s failed: %s", fsmStateName(target), error.c_str());
+    return hardware_interface::return_type::ERROR;
+  }
+  RCLCPP_INFO(get_logger(), "command mode switch -> %s", fsmStateName(target));
+  return hardware_interface::return_type::OK;
+}
+
 // ---------------------------------------------------------------------------
 // FSM services
 // ---------------------------------------------------------------------------
@@ -1041,7 +1149,11 @@ void Z1System::handle_set_fsm_state(
   }
 
   std::string error;
-  if (!request_state_and_wait(state, request->label, error)) {
+  // LOWCMD 只能从 PASSIVE 进入,service 同样走两步路径(见 request_lowcmd)。
+  const bool ok = (state == UNITREE_ARM::ArmFSMState::LOWCMD)
+                    ? request_lowcmd(error)
+                    : request_state_and_wait(state, request->label, error);
+  if (!ok) {
     response->message = error;
     response->current_state =
       fsmStateName(static_cast<UNITREE_ARM::ArmFSMState>(reported_state_.load()));

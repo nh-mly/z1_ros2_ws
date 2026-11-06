@@ -128,4 +128,7 @@ def controller_spawner(controller: str, spawner_args: list, use_sim_time: bool =
 
 # The controller set every bringup path activates (see z1_bringup/config).
 ARM_CONTROLLERS = ["joint_state_broadcaster", "joint_trajectory_controller"]
+# 力矩模式:z1_torque_controller 顶替 JTC 拿走 effort 接口
+# (配合 config/z1_controllers_gz_torque.yaml,经 controllers_file:= 传入)。
+TORQUE_CONTROLLERS = ["joint_state_broadcaster", "z1_torque_controller"]
 GRIPPER_CONTROLLER = "gripper_controller"

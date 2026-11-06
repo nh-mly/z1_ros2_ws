@@ -1,0 +1,29 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>z1_gravity_comp</name>
+  <version>0.1.0</version>
+  <description>
+    Gravity compensation for the gripperless Unitree Z1 arm: computes the
+    gravity torque tau_grav = G(q) from the URDF dynamics with KDL RNE and
+    publishes it to Z1TorqueController's torque_commands topic, giving the
+    arm a zero-G (floating) behaviour for hand-guiding.
+  </description>
+  <maintainer email="xiaozhu@example.com">xiaozhu</maintainer>
+  <license>BSD-3-Clause</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+
+  <depend>kdl_parser</depend>
+  <depend>rclcpp</depend>
+  <depend>sensor_msgs</depend>
+  <depend>std_msgs</depend>
+  <depend>std_srvs</depend>
+
+  <exec_depend>xacro</exec_depend>
+  <exec_depend>ros2launch</exec_depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>

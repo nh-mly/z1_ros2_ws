@@ -1,0 +1,48 @@
+# controller_manager configuration for torque-control mode (Gazebo Sim).
+#
+# z1_torque_controller 与 joint_trajectory_controller 争抢同一组 effort 命令
+# 接口,两者**不能放进同一个 controllers_file**:gz_ros2_control 插件在 Gazebo
+# 启动时会自动加载并激活文件里的全部控制器,两个控制器谁能拿到接口是
+# 随机的(默认文件 z1_controllers_gz_effort.yaml 因此只保留 JTC)。
+#
+# 力矩模式用本文件启动:
+#
+#   ros2 launch z1_bringup gazebo_ros2_control.launch.py use_gripper:=false \
+#     controllers_file:=<z1_bringup>/config/z1_controllers_gz_torque.yaml
+#
+# 注意:力矩控制没有位置伺服也没有重力补偿,joint2~joint6 会随重力下坠;
+# 平衡力矩必须由发布者给出(这正是上层重力补偿要做的事)。
+
+controller_manager:
+  ros__parameters:
+    update_rate: 250  # Hz, matches z1_controller: CtrlComponents::dt = 1/250 s
+
+    joint_state_broadcaster:
+      type: joint_state_broadcaster/JointStateBroadcaster
+
+    z1_torque_controller:
+      type: z1_controllers/Z1TorqueController
+
+z1_torque_controller:
+  ros__parameters:
+    joints:
+      - joint1
+      - joint2
+      - joint3
+      - joint4
+      - joint5
+      - joint6
+
+    # 力矩限幅 = 关节的 URDF effort 限幅(const.xacro 的 torqueMax,
+    # joint2 加倍)。
+    effort_limits:
+      joint1: 30.0
+      joint2: 60.0
+      joint3: 30.0
+      joint4: 30.0
+      joint5: 30.0
+      joint6: 30.0
+
+    # 超过这么久没有新指令就把输出强制清零;0.0 关闭看门狗(保持最后
+    # 一条指令)。
+    command_timeout: 0.25

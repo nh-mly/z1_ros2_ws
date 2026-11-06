@@ -16,7 +16,7 @@ the UDP transport rate (see z1_ros2_control/README.md).
 """
 
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument
+from launch.actions import DeclareLaunchArgument, OpaqueFunction
 from launch.conditions import IfCondition
 from launch.substitutions import Command, LaunchConfiguration, PathJoinSubstitution
 from launch_ros.actions import Node
@@ -27,6 +27,7 @@ from z1_bringup.launch_parts import (
     ARM_CONTROLLERS,
     CONTROLLER_MANAGER,
     GRIPPER_CONTROLLER,
+    TORQUE_CONTROLLERS,
     controller_spawner,
 )
 
@@ -82,6 +83,17 @@ def generate_launch_description() -> LaunchDescription:
                 "real-arm hardware component, i.e. the SendCmd rate z1_ctrl sees"
             ),
         ),
+        DeclareLaunchArgument(
+            "use_torque_control",
+            default_value="false",
+            choices=["true", "false"],
+            description=(
+                "Spawn z1_torque_controller instead of joint_trajectory_controller. "
+                "Use together with controllers_file:=config/z1_controllers_torque.yaml "
+                "(the two controllers claim the same joints, so they cannot share "
+                "one controllers_file)."
+            ),
+        ),
     ] + [
         DeclareLaunchArgument(name, default_value=default, description=description)
         for name, default, description in HARDWARE_PARAMETERS
@@ -96,6 +108,21 @@ def generate_launch_description() -> LaunchDescription:
     robot_description = ParameterValue(Command(xacro_args), value_type=str)
 
     spawner_args = ["--controller-manager", CONTROLLER_MANAGER]
+
+    def spawner_actions(context):
+        """力矩模式 spawn 力矩控制器,否则 spawn 默认位置控制器。"""
+        use_torque = (
+            context.launch_configurations.get("use_torque_control", "false").lower() == "true"
+        )
+        controllers = TORQUE_CONTROLLERS if use_torque else ARM_CONTROLLERS
+        actions = [controller_spawner(c, spawner_args) for c in controllers]
+        if not use_torque:
+            actions.append(
+                controller_spawner(
+                    GRIPPER_CONTROLLER, spawner_args, condition=IfCondition(use_gripper)
+                )
+            )
+        return actions
 
     nodes = [
         # Publishes /robot_description (transient local); ros2_control_node reads
@@ -114,12 +141,7 @@ def generate_launch_description() -> LaunchDescription:
             output="screen",
             parameters=[controllers_file],
         ),
-    ] + [
-        controller_spawner(controller, spawner_args) for controller in ARM_CONTROLLERS
-    ] + [
-        controller_spawner(
-            GRIPPER_CONTROLLER, spawner_args, condition=IfCondition(use_gripper)
-        ),
+        OpaqueFunction(function=spawner_actions),
     ]
 
     return LaunchDescription(declared_args + nodes)

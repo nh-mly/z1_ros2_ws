@@ -104,6 +104,28 @@ public:
   hardware_interface::return_type write(
     const rclcpp::Time & time, const rclcpp::Duration & period) override;
 
+  // ---- command mode switching (position <-> effort, JOINTCTRL <-> LOWCMD) ---
+  //
+  // ros2_control's standard hooks, called by the controller_manager when the
+  // active controller set changes. This is what keeps the simulation and the
+  // real arm driven by the *same* switching commands: activating a controller
+  // that claims effort interfaces takes the arm to LOWCMD, activating one that
+  // claims position interfaces takes it back to JOINTCTRL. The FSM request
+  // happens inside perform_ (it may block for at most fsm_timeout_ms_, the
+  // same budget the set_fsm_state service has).
+  hardware_interface::return_type prepare_command_mode_switch(
+    const std::vector<std::string> & start_interfaces,
+    const std::vector<std::string> & stop_interfaces) override;
+  hardware_interface::return_type perform_command_mode_switch(
+    const std::vector<std::string> & start_interfaces,
+    const std::vector<std::string> & stop_interfaces) override;
+
+  /// Map a set of command interfaces about to be started onto the FSM state
+  /// they imply: effort -> LOWCMD, position -> JOINTCTRL, empty or mixed ->
+  /// INVALID (no switch).
+  static UNITREE_ARM::ArmFSMState fsm_state_for_interfaces(
+    const std::vector<std::string> & start_interfaces);
+
 private:
   /// Build the outgoing frame from `command_position_` / `requested_state_`.
   /// Idempotent, and called from both read() and write(); see the .cpp.
@@ -147,6 +169,15 @@ private:
   /// the non-realtime lifecycle and service callbacks.
   bool request_state_and_wait(
     UNITREE_ARM::ArmFSMState state, const std::string & label, std::string & error);
+
+  /// Request LOWCMD, going through PASSIVE first when needed.
+  ///
+  /// z1_ctrl's FSM only allows PASSIVE -> LOWCMD (disassembled from
+  /// libZ1_x86_64.so: State_JointSpace::checkChange's mask 0x4ffa does not
+  /// include bit 16, State_Passive's mask 0x1500c does). The dwell in PASSIVE
+  /// costs the arm a few tens of milliseconds of torque - acceptable for a
+  /// hand-held arm, but the caller should know.
+  bool request_lowcmd(std::string & error);
 
   /// Block until a packet has arrived within `disconnect_timeout_ms_`.
   bool wait_for_first_packet(std::string & error);
@@ -211,6 +242,14 @@ private:
   std::array<double, kMotorCount> motor_effort_{};
   // Written by controllers through the command interfaces, consumed by write().
   std::array<double, kMotorCount> command_position_{};
+
+  // ---- torque mode (LOWCMD) ------------------------------------------------
+  /// Torques written by effort-interface controllers (z1_torque_controller);
+  /// sent to the arm as jointCmd.T while the FSM is in LOWCMD.
+  std::array<double, kMotorCount> command_effort_{};
+  /// Hard torque clamp per motor slot, the last line of defence before the
+  /// wire. Matches const.xacro's torqueMax: 30 N*m, doubled (60) for joint2.
+  std::array<float, kMotorCount> effort_limit_{};
 
   // ---- the label handshake, and the one lock in this class ------------------
   //

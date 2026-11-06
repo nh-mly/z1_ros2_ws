@@ -15,6 +15,7 @@ from launch import LaunchDescription
 from launch.actions import (
     DeclareLaunchArgument,
     IncludeLaunchDescription,
+    OpaqueFunction,
     TimerAction,
 )
 from launch.conditions import IfCondition
@@ -27,6 +28,7 @@ from z1_bringup.launch_parts import (
     ARM_CONTROLLERS,
     CONTROLLER_MANAGER,
     GRIPPER_CONTROLLER,
+    TORQUE_CONTROLLERS,
     controller_spawner,
     common_args,
     gz_sim_includes,
@@ -64,6 +66,17 @@ def generate_launch_description() -> LaunchDescription:
                 "controller_manager parameters; the default drives the arm through "
                 "the effort interfaces with the official torque law. Pass "
                 "config/z1_controllers.yaml for the plain position servo instead."
+            ),
+        ),
+        DeclareLaunchArgument(
+            "use_torque_control",
+            default_value="false",
+            choices=["true", "false"],
+            description=(
+                "Spawn z1_torque_controller instead of joint_trajectory_controller. "
+                "Use together with controllers_file:=config/z1_controllers_gz_torque.yaml "
+                "(the torque controller and the trajectory controller claim the same "
+                "effort interfaces, so they cannot share one controllers_file)."
             ),
         ),
     ]
@@ -108,20 +121,31 @@ def generate_launch_description() -> LaunchDescription:
         spawn_model(),
     ]
 
+    def spawner_actions(context):
+        """力矩模式 spawn 力矩控制器,否则 spawn 默认轨迹控制器。
+
+        launch 里不能用普通 Python 条件判断 LaunchConfiguration 的值,
+        所以放在 OpaqueFunction 里按解析后的参数决定 spawn 列表。
+        """
+        use_torque = (
+            context.launch_configurations.get("use_torque_control", "false").lower() == "true"
+        )
+        controllers = TORQUE_CONTROLLERS if use_torque else ARM_CONTROLLERS
+        actions = [controller_spawner(c, spawner_args, use_sim_time=True) for c in controllers]
+        if not use_torque:
+            actions.append(
+                controller_spawner(
+                    GRIPPER_CONTROLLER,
+                    spawner_args,
+                    use_sim_time=True,
+                    condition=IfCondition(LaunchConfiguration("use_gripper")),
+                )
+            )
+        return actions
+
     spawners = TimerAction(
         period=SPAWNER_DELAY_S,
-        actions=[
-            controller_spawner(controller, spawner_args, use_sim_time=True)
-            for controller in ARM_CONTROLLERS
-        ]
-        + [
-            controller_spawner(
-                GRIPPER_CONTROLLER,
-                spawner_args,
-                use_sim_time=True,
-                condition=IfCondition(LaunchConfiguration("use_gripper")),
-            ),
-        ],
+        actions=[OpaqueFunction(function=spawner_actions)],
     )
 
     return LaunchDescription(

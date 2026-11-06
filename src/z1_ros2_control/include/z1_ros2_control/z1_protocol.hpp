@@ -195,9 +195,11 @@ inline const char * fsmStateName(UNITREE_ARM::ArmFSMState state)
 /// Parse one of the names printed by `fsmStateName` (case-insensitive).
 /// Returns false for an unknown name; `out` is untouched then.
 ///
-/// `LOWCMD` is deliberately absent from the table below: it hands raw motor
-/// commands to the arm and bypasses z1_ctrl's joint servo law, so nothing in
-/// this workspace may ask for it. `INVALID`, `NEXT` and the retired `SETTRAJ`
+/// `LOWCMD` is in the table but deliberately NOT part of any "safe" list: it
+/// hands raw motor commands to the arm and bypasses z1_ctrl's joint servo law.
+/// It is reachable only through the set_fsm_state service (with zero torque by
+/// default) and the command-mode-switch hooks, never through
+/// activate_fsm_sequence. `INVALID`, `NEXT` and the retired `SETTRAJ`
 /// are internal markers rather than states one can request.
 inline bool parseFsmStateName(const std::string & name, UNITREE_ARM::ArmFSMState & out)
 {
@@ -215,6 +217,7 @@ inline bool parseFsmStateName(const std::string & name, UNITREE_ARM::ArmFSMState
     {"TEACHREPEAT", UNITREE_ARM::ArmFSMState::TEACHREPEAT},
     {"CALIBRATION", UNITREE_ARM::ArmFSMState::CALIBRATION},
     {"BACKTOSTART", UNITREE_ARM::ArmFSMState::BACKTOSTART},
+    {"LOWCMD", UNITREE_ARM::ArmFSMState::LOWCMD},
   };
   for (const auto & [text, state] : kTable) {
     if (name.size() == std::string(text).size()) {
@@ -272,10 +275,11 @@ inline const char * labelledFsmStates()
 }
 
 /// States the `set_fsm_state` service accepts: `safeFsmStates()` plus
-/// `labelledFsmStates()`.
+/// `labelledFsmStates()` plus LOWCMD (raw torque mode; see
+/// parseFsmStateName's comment for how it is gated).
 inline const char * serviceFsmStates()
 {
-  return "PASSIVE|JOINTCTRL|BACKTOSTART|CALIBRATION|TOSTATE|SAVESTATE|TEACH|TEACHREPEAT";
+  return "PASSIVE|JOINTCTRL|BACKTOSTART|CALIBRATION|TOSTATE|SAVESTATE|TEACH|TEACHREPEAT|LOWCMD";
 }
 
 /// True for the states that read `SendCmd::valueUnion.name`.
@@ -309,7 +313,8 @@ inline bool isSafeFsmState(UNITREE_ARM::ArmFSMState state)
 /// Member of `serviceFsmStates()`, i.e. legal in a `set_fsm_state` request.
 inline bool isServiceFsmState(UNITREE_ARM::ArmFSMState state)
 {
-  return isSafeFsmState(state) || fsmStateTakesLabel(state);
+  return isSafeFsmState(state) || fsmStateTakesLabel(state) ||
+         state == UNITREE_ARM::ArmFSMState::LOWCMD;
 }
 
 }  // namespace z1_ros2_control

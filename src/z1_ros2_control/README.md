@@ -76,13 +76,41 @@ ros2 launch z1_bringup control.launch.py use_gripper:=false
 
 | 方向 | 名称 | 说明 |
 |---|---|---|
-| 命令 | `joint1..joint6`（+`jointGripper`） `/position` | 唯一被转发的命令接口 |
+| 命令 | `joint1..joint6`（+`jointGripper`） `/position` | JOINTCTRL 下被转发的位置命令 |
+| 命令 | `joint1..joint6` `/effort` | LOWCMD（力矩模式）下被转发的力矩命令（见下） |
 | 状态 | `joint1..joint6`（+`jointGripper`） `/position` `/velocity` `/effort` | 来自每个 `RecvState` |
 | 服务 | `~/set_fsm_state`（`z1_ros2_control/srv/SetFSMState`） | 请求 FSM 状态，可带 label |
 | 服务 | `~/get_fsm_state`（`z1_ros2_control/srv/GetFSMState`） | 只读查询 |
 
 节点名就是 URDF 里 `<ros2_control name="z1">` 的 `z1`，所以默认是
 `/z1/set_fsm_state`、`/z1/get_fsm_state`。
+
+## 力矩模式（LOWCMD）
+
+除位置接口外，真机路径还暴露 `effort` 命令接口。控制器切换由 ros2_control 的
+**命令模式切换**自动联动 FSM：
+
+* 激活 claim `effort` 的控制器（`z1_torque_controller`）→ `prepare/perform_command_mode_switch`
+  请求 **LOWCMD**，`assemble_frame()` 开始发送 `jointCmd.T`（力矩），位姿/速度跟随实测、增益置零；
+* 切回 claim `position` 的控制器 → 自动请求 **JOINTCTRL**。
+
+`LOWCMD` 绕过 `z1_ctrl` 的关节伺服律，因此受到三道约束：
+
+1. **不进 `activate_fsm_sequence`**：只经模式切换钩子或 `set_fsm_state` 服务可达；
+2. **双限幅**：`z1_torque_controller` 的 `effort_limits` + 本组件组帧前的硬限幅
+   （const.xacro 的 torqueMax，joint2=60 N·m）；
+3. **零力矩起点**：进入 LOWCMD 时命令缓冲为零（控制器激活时清零），
+   上层不发力矩 = 机械臂软塌，属可预测失效。
+
+FSM 转移规则（反汇编 `libZ1_x86_64.so` 的 checkChange 掩码确认）：
+
+* `PASSIVE -> LOWCMD` 是唯一合法的 LOWCMD 入口（`State_Passive` 掩码 `0x1500c`
+  含 bit16）；`JOINTCTRL -> LOWCMD` 会被拒绝（`State_JointSpace` 掩码 `0x4ffa`
+  不含 bit16）。因此组件自动走 `PASSIVE -> LOWCMD` 两步（中间臂失力几十
+  毫秒，持臂者请注意）。
+* `LOWCMD -> JOINTCTRL` / `LOWCMD -> PASSIVE` 直达合法。
+
+⚠️ LOWCMD 下 `z1_ctrl` 的碰撞保护行为**未经真机验证**，真机测试必须有人扶臂。
 
 ```bash
 ros2 service call /z1/get_fsm_state z1_ros2_control/srv/GetFSMState "{}"
@@ -91,7 +119,8 @@ ros2 service call /z1/set_fsm_state z1_ros2_control/srv/SetFSMState "{state: TOS
 ros2 service call /z1/set_fsm_state z1_ros2_control/srv/SetFSMState "{state: PASSIVE, label: ''}"
 ```
 
-只暴露位置命令接口是刻意的：`z1_ctrl` 的关节伺服律是固定的，送增益或力矩没有意义。
+只暴露位置命令接口是刻意的：`z1_ctrl` 的关节伺服律是固定的，送增益没有意义。
+力矩则走独立的 LOWCMD 路径（见"力矩模式"一节），而不是混在 JOINTCTRL 里。
 
 另外有一个 bring-up 用的小工具（不属于控制器栈）：
 

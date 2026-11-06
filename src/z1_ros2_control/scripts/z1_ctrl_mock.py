@@ -107,6 +107,7 @@ STATE_NAMES = {value: name for name, value in FSM_STATES.items()}
 
 PASSIVE = FSM_STATES['PASSIVE']
 JOINTCTRL = FSM_STATES['JOINTCTRL']
+LOWCMD = FSM_STATES['LOWCMD']
 
 # Motor_Connected.state, packed into the top two bits of a uint8. 0 means the
 # motor is connected; nothing here ever sets a fault, that is what
@@ -132,6 +133,7 @@ class MockZ1:
         # starts it wherever it is and never moves it.
         self.velocity = [0.0] * MOTOR_COUNT
         self.target = list(self.position)
+        self.tau_target = [0.0] * MOTOR_COUNT
 
         self.fsm = PASSIVE
         self.track = False
@@ -168,8 +170,8 @@ class MockZ1:
             if len(data) != SEND_CMD.size:
                 self.rx_bad_size += 1
                 continue
-            head, state, track, blob = SEND_CMD.unpack(data)
-            if bytes([head[0], head[1]]) != HEAD:
+            head0, head1, state, track, blob = SEND_CMD.unpack(data)
+            if bytes([head0, head1]) != HEAD:
                 self.rx_bad_head += 1
                 continue
             if state not in STATE_NAMES:
@@ -189,8 +191,12 @@ class MockZ1:
             self.track = track
 
             for index in range(self.joint_count):
-                _t, _w, pos, _kp, _kw = JOINT_CMD.unpack_from(blob, JOINT_CMD.size * index)
-                self.target[index] = pos
+                t, w, pos, kp, kw = JOINT_CMD.unpack_from(blob, JOINT_CMD.size * index)
+                if state == LOWCMD:
+                    # Raw torque mode: the payload's T field is the command.
+                    self.tau_target[index] = t
+                else:
+                    self.target[index] = pos
 
             self.last_rx_time = time.monotonic()
 
@@ -229,6 +235,15 @@ class MockZ1:
 
     def step(self, dt):
         """Move the joints towards their targets, with a velocity limit."""
+        if self.fsm == LOWCMD:
+            # Raw torque mode: integrate the commanded torque through a trivial
+            # first-order plant (inertia + viscous friction). No position loop.
+            for index in range(self.joint_count):
+                accel = (self.tau_target[index] -
+                         self.args.friction * self.velocity[index]) / self.args.inertia
+                self.velocity[index] += accel * dt
+                self.position[index] += self.velocity[index] * dt
+            return
         if self.fsm != JOINTCTRL or not self.track:
             for index in range(MOTOR_COUNT):
                 self.velocity[index] = 0.0
@@ -349,6 +364,10 @@ def parse_args(argv):
                         help='reported torque per rad of tracking error (default: %(default)s)')
     parser.add_argument('--torque-limit', type=float, default=30.0,
                         help='reported torque clamp, N*m (default: %(default)s)')
+    parser.add_argument('--inertia', type=float, default=1.0,
+                        help='LOWCMD plant inertia per joint (default: %(default)s)')
+    parser.add_argument('--friction', type=float, default=1.0,
+                        help='LOWCMD plant viscous friction per joint (default: %(default)s)')
     parser.add_argument('--initial', type=float, nargs='*', default=[],
                         help='initial joint angles in radians (default: all zero)')
     parser.add_argument('--disconnect-ms', type=float, default=100.0,

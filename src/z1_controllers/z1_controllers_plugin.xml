@@ -1,12 +1,28 @@
-<library path="z1_joint_trajectory_controller">
-  <class name="z1_controllers/Z1JointTrajectoryController"
-         type="z1_controllers::Z1JointTrajectoryController"
-         base_class_type="controller_interface::ControllerInterface">
-    <description>
-      Torque (effort) controller for the Z1 arm that executes FollowJointTrajectory
-      goals with the official Unitree torque law
-      (tau = Kp*(q_des - q) + Kd*(qdot_des - qdot), clamped to the effort limit)
-      and writes to the joints' effort command interfaces.
-    </description>
-  </class>
-</library>
+<class_libraries>
+  <library path="z1_joint_trajectory_controller">
+    <class name="z1_controllers/Z1JointTrajectoryController"
+           type="z1_controllers::Z1JointTrajectoryController"
+           base_class_type="controller_interface::ControllerInterface">
+      <description>
+        Torque (effort) controller for the Z1 arm that executes FollowJointTrajectory
+        goals with the official Unitree torque law
+        (tau = Kp*(q_des - q) + Kd*(qdot_des - qdot), clamped to the effort limit)
+        and writes to the joints' effort command interfaces.
+      </description>
+    </class>
+  </library>
+
+  <library path="z1_torque_controller">
+    <class name="z1_controllers/Z1TorqueController"
+           type="z1_controllers::Z1TorqueController"
+           base_class_type="controller_interface::ControllerInterface">
+      <description>
+        直接力矩控制:把 Float64MultiArray 话题里的原始关节力矩
+        (元素顺序 = joints 参数)转发到各关节的 effort 命令接口,
+        并按 effort_limits 限幅。无伺服律、无轨迹逻辑、无重力补偿——
+        这是上层力矩控制器发布指令的底层入口。command_timeout 看门狗
+        在发布者停发后把输出清零。
+      </description>
+    </class>
+  </library>
+</class_libraries>

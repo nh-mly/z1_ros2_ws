@@ -68,6 +68,254 @@ ros2 action send_goal /gripper_controller/gripper_cmd \
 ros2 topic pub --once /joint1/cmd_pos std_msgs/msg/Float64 "{data: 0.6}"
 ```
 
+## 实机力矩控制与重力补偿(命令说明)
+
+> 纯命令速查见 [`实机验证步骤.md`](实机验证步骤.md);本节说明每条命令的用途、
+> 预期结果与注意事项。前置:`z1_ctrl` 已编译并运行、本机网卡 `192.168.123.x`、
+> **全程有人扶臂**。所有终端先
+> `source /opt/ros/jazzy/setup.bash && source ~/z1_ros2_ws/install/setup.bash`。
+
+### 阶段 B:最小真机验证
+
+#### B1. JOINTCTRL 基准
+
+```bash
+source /opt/ros/jazzy/setup.bash && source ~/z1_ros2_ws/install/setup.bash
+ros2 launch z1_bringup control.launch.py use_gripper:=false
+```
+
+* 用途:用默认配置验证位置后端(JOINTCTRL)正常。
+* 预期:`ros2 control list_controllers` 显示 JSB + JTC active;臂被伺服律持住;
+  `get_fsm_state` 返回 `JOINTCTRL`。
+* 退出:Ctrl-C(臂软塌,先扶住)。
+
+#### B2. LOWCMD 零力矩
+
+```bash
+ros2 launch z1_bringup control.launch.py use_gripper:=false \
+  use_torque_control:=true \
+  controllers_file:=$(ros2 pkg prefix z1_bringup)/share/z1_bringup/config/z1_controllers_torque.yaml
+```
+
+```bash
+ros2 service call /z1/get_fsm_state z1_ros2_control/srv/GetFSMState "{}"
+```
+
+* 用途:启动力矩后端;组件激活力矩控制器时会自动把 z1_ctrl 切到 LOWCMD。
+* 关键知识:z1_ctrl 的 FSM **只允许 PASSIVE→LOWCMD**(反汇编
+  `State_JointSpace::checkChange` 掩码 `0x4ffa` 不含 bit16,`State_Passive`
+  掩码 `0x1500c` 含 bit16),组件自动走两步。
+* 日志判读:`command mode switch -> LOWCMD` = 成功;
+  `FSM transition to LOWCMD failed` = 被拒(臂留在 JOINTCTRL,安全,立即停止)。
+* `get_fsm_state` 预期:`state='LOWCMD'`,扶臂者感到臂变软。
+
+#### B3. 小力矩微动
+
+```bash
+timeout 6 ros2 topic pub --rate 250 /z1_torque_controller/torque_commands \
+  std_msgs/msg/Float64MultiArray "{data: [10.0, 0.0, 0.0, 0.0, 0.0, 0.0]}"
+```
+
+```bash
+ros2 topic echo --qos-reliability best_effort /joint_states --field effort
+```
+
+* 用途:验证力矩到达真机电机(只动 joint1——铅垂轴,无重力负载,最安全)。
+* 前置:launch 必须在运行(否则 `/joint_states` 不发布,echo 报
+  `does not appear to be published yet`)。
+* 判读:effort(joint1)≈10 = 力矩到电机;≈0 = z1_ctrl 打包层清零(继续查
+  IOUDP);中间值 = 钳位/损耗。
+* 异常:剧烈动作/异响 → 立即 Ctrl-C launch(客户端停发 → z1_ctrl 自动 PASSIVE)。
+
+#### B4. 安全退出
+
+```bash
+ros2 service call /z1/set_fsm_state z1_ros2_control/srv/SetFSMState "{state: PASSIVE, label: ''}"
+# 然后 Ctrl-C launch
+```
+
+* 预期:`PASSIVE acknowledged`;臂完全软塌(扶住)。
+
+### 阶段 C:真机完整重力补偿
+
+#### C1. GC 节点
+
+```bash
+ros2 launch z1_gravity_comp gravity_comp.launch.py
+ros2 param set /gravity_comp gravity_factor 1.0
+ros2 service call /gravity_comp/enable std_srvs/srv/SetBool "{data: true}"
+```
+
+* 用途:先起 GC 并备好 τ_grav(顺序关键:GC 必须先于机械臂)。
+* 预期:T2 日志出现 `gravity_factor -> 1.00`;此时臂未启动,`no /joint_states`
+  警告正常;节点保持运行。
+
+#### C2. 力矩模式
+
+```bash
+ros2 launch z1_bringup control.launch.py use_gripper:=false \
+  use_torque_control:=true \
+  controllers_file:=$(ros2 pkg prefix z1_bringup)/share/z1_bringup/config/z1_controllers_torque.yaml
+```
+
+* 预期序列:硬件激活 → JOINTCTRL 持住 → 力矩控制器激活 → LOWCMD →
+  GC 的 τ_grav 接管,臂悬浮("轻若无物")。
+
+#### C3. 悬浮/示教验证(无命令)
+
+* 轻推臂 → 轻盈随动;松手 → 停住;漂移/下坠 → 查 `gravity_factor` 日志。
+
+#### C4. 关闭对照
+
+```bash
+ros2 service call /gravity_comp/enable std_srvs/srv/SetBool "{data: false}"
+```
+
+* 预期:臂立刻变沉/下坠(扶住)——证明悬浮是 GC 的功劳。
+
+#### C5. 退出(无命令)
+
+* `set_fsm_state PASSIVE` → Ctrl-C 两个 launch → 停 `z1_ctrl`。
+
+### 完整流程(从开机到复位)
+
+#### T0. z1_ctrl
+
+```bash
+cd ~/z1_controller/build && ./z1_ctrl
+```
+
+* 用途:官方底层控制器(UDP 8071/8072,loopback);一启动臂就 PASSIVE,先扶住。
+
+#### T2. GC 节点
+
+```bash
+source /opt/ros/jazzy/setup.bash && source ~/z1_ros2_ws/install/setup.bash
+ros2 launch z1_gravity_comp gravity_comp.launch.py
+```
+
+* 用途:先起 GC;`no /joint_states` 警告正常,节点别关。
+
+#### T3. 使能 GC
+
+```bash
+ros2 param set /gravity_comp gravity_factor 1.0
+ros2 service call /gravity_comp/enable std_srvs/srv/SetBool "{data: true}"
+# 回 T2 确认日志出现 "gravity_factor -> 1.00"
+```
+
+* 用途:重力系数 1.0 + 使能;必须确认日志,否则 GC 输出恒 0。
+
+#### T1. 力矩模式
+
+```bash
+source /opt/ros/jazzy/setup.bash && source ~/z1_ros2_ws/install/setup.bash
+ros2 launch z1_bringup control.launch.py use_gripper:=false \
+  use_torque_control:=true \
+  controllers_file:=$(ros2 pkg prefix z1_bringup)/share/z1_bringup/config/z1_controllers_torque.yaml
+```
+
+* 预期:JOINTCTRL → LOWCMD → GC 接管,臂变轻。
+
+#### 验证
+
+```bash
+ros2 control list_controllers
+ros2 service call /z1/get_fsm_state z1_ros2_control/srv/GetFSMState "{}"   # LOWCMD
+ros2 topic echo --qos-reliability best_effort /joint_states --field effort --once
+# joint2/3/4 应有重力支撑力矩(几 N·m)
+```
+
+* 判读:JSB + 力矩控制器 active、`state='LOWCMD'`、joint2/3/4 有重力支撑力矩;
+  手感推/停。
+
+#### 关闭对照
+
+```bash
+ros2 service call /gravity_comp/enable std_srvs/srv/SetBool "{data: false}"
+```
+
+* 预期:臂立刻变沉(下坠,扶住)。
+
+#### 复位
+
+```bash
+ros2 run z1_ros2_control reset_to_start.py
+```
+
+* 预期:臂自动缓速回 `startFlat` 并停住。
+
+#### 结束
+
+```bash
+ros2 service call /z1/get_fsm_state z1_ros2_control/srv/GetFSMState "{}"
+# 然后 Ctrl-C 关 T2/T1,最后停 z1_ctrl
+```
+
+### 步骤 5:复位(方案 A)
+
+#### 一键脚本
+
+```bash
+ros2 run z1_ros2_control reset_to_start.py
+# 可选参数:
+#   --no-gc      GC 节点没在跑时跳过"关闭重力补偿"
+#   --timeout N  等待到位的最长秒数(默认 30)
+```
+
+* 流程:关 GC → 请求 `BACKTOSTART` → 用关节位形收敛判断到位。
+* 为什么不用 FSM 判到位:BACKTOSTART 期间 FSM 在 BACKTOSTART/JOINTCTRL 间跳。
+* 依据:反汇编 `State_LowCmd` 出口掩码 `0x4006` 含 bit14(BACKTOSTART 合法);
+  `TOSTATE`(去 forward)从 LOWCMD 不可达。
+* 运动形式:机械臂**自动**缓速运动,人只做轻扶监护。
+
+#### 手动命令
+
+```bash
+ros2 service call /gravity_comp/enable std_srvs/srv/SetBool "{data: false}"
+ros2 service call /z1/set_fsm_state z1_ros2_control/srv/SetFSMState "{state: BACKTOSTART, label: ''}"
+ros2 service call /z1/get_fsm_state z1_ros2_control/srv/GetFSMState "{}"
+```
+
+### 关键知识(反汇编 `libZ1_x86_64.so` 所得)
+
+#### FSM 转移规则
+
+| 转移 | 合法? | 证据 |
+|---|---|---|
+| JOINTCTRL → LOWCMD | ❌ | `State_JointSpace::checkChange` 掩码 `0x4ffa` 无 bit16 |
+| PASSIVE → LOWCMD | ✅ 唯一入口 | `State_Passive` 掩码 `0x1500c` 含 bit16 |
+| LOWCMD → JOINTCTRL / PASSIVE | ✅ | `State_LowCmd` 出口掩码 `0x4006` 含 bit1/2 |
+| LOWCMD → BACKTOSTART | ✅ | 同上掩码含 bit14 |
+
+#### LOWCMD 载荷语义(20 字节 JointCmd)
+
+| 字段名 | 真机含义 | 我们的组帧 |
+|---|---|---|
+| Pos | q 目标 | 实测位置(零位置误差) |
+| W | qd 目标 | 实测速度(零速度误差) |
+| T | 力矩前馈 τ_ff | clamp(command_effort, ±30/60) |
+| K_P / K_W | 增益 | 0(纯前馈,关闭内部伺服) |
+
+电机执行:`τ = Kp·(q−qm) + Kw·(q̇−q̇m) + T`
+
+### 安全红线
+
+1. **永远有人扶臂**,手不放
+2. 力矩从 **2 N·m** 起步,确认方向后再加大
+3. 任何异常:先 Ctrl-C launch(客户端停发 → PASSIVE),再断电
+4. 不在臂附近放易损物;LOWCMD 下 z1_ctrl 碰撞保护行为未知
+
+### 验证状态
+
+| 阶段 | 结果 |
+|---|---|
+| B1 JOINTCTRL 基准 | ✅ |
+| B2 LOWCMD 进入(两步修复后) | ✅ |
+| B3 力矩通路(10 N·m → effort ≈8~14) | ✅ |
+| B4 PASSIVE 退出 | ✅ |
+| C2~C4 悬浮 / 关闭对照 | ✅ |
+
 ## 效果
 
 | Gazebo Sim（`gazebo.launch.py`） | MoveIt 2（`z1_moveit_config demo.launch.py`） |

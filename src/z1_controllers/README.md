@@ -99,3 +99,66 @@ joint5 = joint6 = 0。留空则仅保持上电瞬间的位置。
 * 容差：运行中越界报 `PATH_TOLERANCE_VIOLATED`；跑完后 `goal_time` 内没进入目标容差报
   `GOAL_TOLERANCE_VIOLATED`；取消后回到保持点并报 `canceled`。
 * 实时循环内只做插值 + PD + 写命令；动作结果由非实时的 wall timer 上报。
+
+## Z1TorqueController（力矩控制）
+
+Gazebo 力矩控制（effort 接口）的底层：把原始关节力矩从
+`Float64MultiArray` 话题**原样转发**到关节的 effort 命令接口——
+
+```
+tau = clamp(tau_cmd, -effort_limit, +effort_limit)
+```
+
+刻意**不含**位置伺服、轨迹逻辑和重力补偿；重力补偿、导纳控制等上层算法
+作为发布者接在它上面。真机路径（`Z1System`）目前只暴露位置命令接口，
+这个控制器在真机 backend 下无法激活。
+
+### 接口
+
+| 方向 | 名称 | 说明 |
+|---|---|---|
+| 话题 | `~/torque_commands`（`std_msgs/msg/Float64MultiArray`） | 每个元素一个关节力矩（N·m），顺序 = 参数 `joints` |
+
+### 参数
+
+| 参数 | 默认 | 含义 |
+|---|---|---|
+| `joints` | — | 受控关节，顺序即 `data` 的元素顺序 |
+| `effort_limits.<joint>` | 30.0 | 力矩限幅（`z1_controllers_gz_torque.yaml` 里 joint2 = 60，与 URDF 一致） |
+| `command_timeout` | 0.25 s | 超过这么久没有新指令就把输出强制清零；0 表示保持最后一条指令 |
+
+### 用法（Gazebo）
+
+它和 `joint_trajectory_controller` 抢同一组 effort 接口，**不能同时激活**，
+也不能放进同一个 `controllers_file`（gz_ros2_control 启动时会自动激活文件里的
+全部控制器，两个控制器争抢接口、谁拿到是随机的）。力矩模式用独立配置 +
+`use_torque_control:=true` 启动（该参数把 spawn 的控制器集合从 JTC 换成力矩
+控制器）：
+
+```bash
+ros2 launch z1_bringup gazebo_ros2_control.launch.py use_gripper:=false \
+  use_torque_control:=true \
+  controllers_file:=$(ros2 pkg prefix z1_bringup)/share/z1_bringup/config/z1_controllers_gz_torque.yaml
+
+# 持续发固定力矩（joint1 是铅垂轴，不受重力影响，会持续转动）
+ros2 topic pub --rate 250 /z1_torque_controller/torque_commands \
+  std_msgs/msg/Float64MultiArray "{data: [1.0, 0.0, 0.0, 0.0, 0.0, 0.0]}"
+```
+
+或在默认启动（JTC 已激活）后手动切换。旧版 CLI 用两步
+`set_controller_state`；新版可用
+`switch_controllers --stop ... --start ... --strict` 一步完成：
+
+```bash
+ros2 control load_controller --set-state inactive z1_torque_controller
+ros2 control set_controller_state joint_trajectory_controller inactive
+ros2 control set_controller_state z1_torque_controller active
+
+# 切回位置控制
+ros2 control set_controller_state z1_torque_controller inactive
+ros2 control set_controller_state joint_trajectory_controller active
+```
+
+注意：力矩控制下**没有重力补偿也没有位置保持**，joint2~joint6 会随重力下坠，
+发布者必须自己给出平衡力矩（这正是上层重力补偿要做的）。`command_timeout`
+看门狗保证发布者停止后输出自动归零。
